@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Analyze Zhipu billing Excel files by apiKey.
 
-The input is an .xlsx file with these columns:
+The input is one or more .xlsx files with these columns:
   C: 入账时间
   F: apiKey
   P: 单价单位
   S: 用量
 
-Rows whose 单价单位 is 千token are aggregated by apiKey. Usage during the
-peak window 14:00 <= time < 18:00 on weekdays (Monday-Friday) is multiplied
-by 3 for billed usage, while its original unmultiplied usage is also
-reported. Weekends (Saturday/Sunday) are never treated as peak.
+Rows whose 单价单位 is 千token are aggregated by apiKey across all input
+files. Usage during the peak window 14:00 <= time < 18:00 on weekdays
+(Monday-Friday) is multiplied by 3 for billed usage, while its original
+unmultiplied usage is also reported. Weekends (Saturday/Sunday) are never
+treated as peak.
 """
 
 import argparse
 import csv
 import datetime as _datetime
+import glob
 import os
 import re
 import sys
@@ -304,9 +306,33 @@ def split_keys(values):
     return result
 
 
-def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filter=None, exclude_filter=None):
-    summaries = OrderedDict()
-    stats = {
+def expand_files(paths):
+    """展开输入参数：支持逗号分隔多个路径；存在的文件直接使用，否则按通配符模式展开；去重且保持顺序。"""
+    files = []
+    for item in paths:
+        for path in item.split(","):
+            path = path.strip()
+            if not path:
+                continue
+            if os.path.isfile(path):
+                files.append(path)
+                continue
+            matched = sorted(glob.glob(path))
+            if matched:
+                files.extend(matched)
+            else:
+                files.append(path)
+    seen = set()
+    result = []
+    for path in files:
+        if path not in seen:
+            seen.add(path)
+            result.append(path)
+    return result
+
+
+def new_stats():
+    return {
         "total_rows": 0,
         "matched_rows": 0,
         "skipped_header_rows": 0,
@@ -318,6 +344,36 @@ def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filt
         "unparsed_time_rows": 0,
         "keys_seen": set(),
     }
+
+
+def merge_stats(target, source):
+    for key in (
+        "total_rows",
+        "matched_rows",
+        "skipped_header_rows",
+        "skipped_unit_rows",
+        "skipped_empty_key_rows",
+        "skipped_bad_usage_rows",
+        "skipped_key_filter_rows",
+        "skipped_key_exclude_rows",
+        "unparsed_time_rows",
+    ):
+        target[key] += source[key]
+    target["keys_seen"].update(source["keys_seen"])
+
+
+def merge_summary(target, source):
+    target.rows += source.rows
+    target.total_raw_usage += source.total_raw_usage
+    target.off_peak_usage += source.off_peak_usage
+    target.peak_raw_usage += source.peak_raw_usage
+    target.peak_weighted_usage += source.peak_weighted_usage
+    target.billable_usage += source.billable_usage
+
+
+def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filter=None, exclude_filter=None):
+    summaries = OrderedDict()
+    stats = new_stats()
 
     for row in iter_rows(xlsx_path, sheet_name):
         stats["total_rows"] += 1
@@ -437,9 +493,13 @@ def hour_arg(value):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="分析智谱账单 Excel：按 apiKey 汇总千token用量，并对 14:00~18:00 高峰期用量按 3 倍计费。"
+        description="分析智谱账单 Excel：按 apiKey 汇总千token用量，并对 14:00~18:00 高峰期用量按 3 倍计费。支持传入多个文件（可用通配符）。"
     )
-    parser.add_argument("excel", help="输入 .xlsx 文件路径")
+    parser.add_argument(
+        "excel",
+        nargs="+",
+        help="输入 .xlsx 文件路径，可传多个（空格或逗号分隔）；支持通配符模式（如 'zhipu_*.xlsx'）",
+    )
     parser.add_argument("--sheet", default="", help="工作表名称；默认读取第一个工作表")
     parser.add_argument("--output", "-o", default="", help="可选：输出 CSV 文件路径")
     parser.add_argument("--peak-start", type=hour_arg, default=14, help="高峰期开始小时，默认 14")
@@ -466,8 +526,11 @@ def main(argv):
     args = parse_args(argv)
     if args.peak_start >= args.peak_end:
         return fail("--peak-start 必须小于 --peak-end")
-    if not os.path.isfile(args.excel):
-        return fail("输入文件不存在：{0}".format(args.excel))
+
+    files = expand_files(args.excel)
+    missing = [path for path in files if not os.path.isfile(path)]
+    if missing:
+        return fail("输入文件不存在：{0}".format(", ".join(missing)))
 
     key_filter = split_keys(args.keys)
     if args.keys and not key_filter:
@@ -480,14 +543,28 @@ def main(argv):
     if not exclude_filter:
         exclude_filter = None
 
+    merged = OrderedDict()
+    merged_stats = new_stats()
+    file_results = []
+
     try:
-        summaries, stats = analyze_file(
-            args.excel, args.sheet, args.peak_start, args.peak_end, key_filter, exclude_filter
-        )
+        for path in files:
+            summaries, stats = analyze_file(
+                path, args.sheet, args.peak_start, args.peak_end, key_filter, exclude_filter
+            )
+            file_results.append((path, summaries, stats))
+            for api_key, summary in summaries.items():
+                if api_key not in merged:
+                    merged[api_key] = BillSummary(api_key)
+                merge_summary(merged[api_key], summary)
+            merge_stats(merged_stats, stats)
     except zipfile.BadZipFile:
-        return fail("输入文件不是有效的 .xlsx：{0}".format(args.excel))
+        return fail("输入文件不是有效的 .xlsx：{0}".format(path))
     except (ET.ParseError, ValueError) as exc:
-        return fail(str(exc))
+        return fail("{0}：{1}".format(path, exc))
+
+    summaries = merged
+    stats = merged_stats
 
     if key_filter:
         missing = [wanted for wanted in key_filter if not any(key_matches(k, [wanted]) for k in stats["keys_seen"])]
@@ -497,6 +574,19 @@ def main(argv):
             return fail("指定的 key 均未匹配到任何 单价单位=千token 的记录")
     elif not summaries and exclude_filter is not None:
         print("提示：排除后没有任何有效记录。", file=sys.stderr)
+
+    if len(files) > 1:
+        print("分文件统计（共 {0} 个文件）：".format(len(files)))
+        for path, file_summaries, file_stats in file_results:
+            file_billable = sum((s.billable_usage for s in file_summaries.values()), Decimal("0"))
+            print(
+                "  {0}  有效行 {1}  总量 {2}".format(
+                    pad_display(os.path.basename(path), 30),
+                    file_stats["matched_rows"],
+                    decimal_to_text(file_billable),
+                )
+            )
+        print("")
 
     print_table(summaries)
     total_raw_usage = sum((summary.total_raw_usage for summary in summaries.values()), Decimal("0"))
@@ -514,6 +604,7 @@ def main(argv):
     print("  高峰3倍总量：{0}".format(decimal_to_text(total_peak_weighted_usage)))
     print("")
     print("处理统计：")
+    print("  输入文件数：{0}".format(len(files)))
     print("  总行数：{0}".format(stats["total_rows"]))
     print("  有效千token记录：{0}".format(stats["matched_rows"]))
     print("  跳过表头行：{0}".format(stats["skipped_header_rows"]))
