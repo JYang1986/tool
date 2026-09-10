@@ -11,7 +11,9 @@ Rows whose 单价单位 is 千token are aggregated by apiKey across all input
 files. Usage during the peak window 14:00 <= time < 18:00 on weekdays
 (Monday-Friday) is multiplied by 3 for billed usage, while its original
 unmultiplied usage is also reported. Weekends (Saturday/Sunday) are never
-treated as peak.
+treated as peak. glm-5.3-flash usage is billed at 0.5x of glm-5.3 at all
+times: the discounted usage per key equals the peak-weighted total minus
+half of the 5.3-flash peak-weighted usage, ceiled to an integer.
 """
 
 import argparse
@@ -25,7 +27,7 @@ import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 
 NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 NS_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -33,9 +35,13 @@ NS_PACKAGE_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}
 
 COLUMN_TIME = "C"
 COLUMN_API_KEY = "F"
+COLUMN_MODEL = "G"
 COLUMN_UNIT = "P"
 COLUMN_USAGE = "S"
 TARGET_UNIT = "千token"
+FLASH_MODEL = "glm-5.3-flash"
+FLASH_BILL_RATE = Decimal("0.5")
+PEAK_MULTIPLIER = Decimal("3")
 EXCEL_EPOCH = _datetime.datetime(1899, 12, 30)
 
 
@@ -48,17 +54,22 @@ class BillSummary(object):
         self.peak_raw_usage = Decimal("0")
         self.peak_weighted_usage = Decimal("0")
         self.billable_usage = Decimal("0")
+        self.discounted_usage = Decimal("0")
+        self.flash_billable_usage = Decimal("0")
 
-    def add(self, usage, is_peak):
+    def add(self, usage, is_peak, is_flash):
         self.rows += 1
         self.total_raw_usage += usage
         if is_peak:
             self.peak_raw_usage += usage
-            self.peak_weighted_usage += usage * Decimal("3")
-            self.billable_usage += usage * Decimal("3")
+            self.peak_weighted_usage += usage * PEAK_MULTIPLIER
         else:
             self.off_peak_usage += usage
-            self.billable_usage += usage
+
+        weighted = usage * PEAK_MULTIPLIER if is_peak else usage
+        self.billable_usage += weighted
+        if is_flash:
+            self.flash_billable_usage += weighted
 
 
 def fail(message):
@@ -283,7 +294,7 @@ def iter_rows(xlsx_path, sheet_name):
             row_values = {}
             for cell in row.findall(NS_MAIN + "c"):
                 col = column_name(cell.attrib.get("r", ""))
-                if col in (COLUMN_TIME, COLUMN_API_KEY, COLUMN_UNIT, COLUMN_USAGE):
+                if col in (COLUMN_TIME, COLUMN_API_KEY, COLUMN_MODEL, COLUMN_UNIT, COLUMN_USAGE):
                     row_values[col] = cell_text(cell, shared_strings)
             yield row_values
 
@@ -369,6 +380,8 @@ def merge_summary(target, source):
     target.peak_raw_usage += source.peak_raw_usage
     target.peak_weighted_usage += source.peak_weighted_usage
     target.billable_usage += source.billable_usage
+    target.discounted_usage += source.discounted_usage
+    target.flash_billable_usage += source.flash_billable_usage
 
 
 def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filter=None, exclude_filter=None):
@@ -406,11 +419,18 @@ def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filt
         if parsed_dt is None:
             stats["unparsed_time_rows"] += 1
         is_peak = is_peak_time(parsed_dt, peak_start_hour, peak_end_hour)
+        is_flash = normalize_text(row.get(COLUMN_MODEL)).lower() == FLASH_MODEL
 
         if api_key not in summaries:
             summaries[api_key] = BillSummary(api_key)
-        summaries[api_key].add(usage, is_peak)
+        summaries[api_key].add(usage, is_peak, is_flash)
         stats["matched_rows"] += 1
+
+    # 打折总量 = 总量 - 5.3-flash总量 × 0.5（向上取整，不带 0.5 小数）
+    for summary in summaries.values():
+        summary.discounted_usage = (
+            summary.billable_usage - summary.flash_billable_usage * FLASH_BILL_RATE
+        ).to_integral_value(rounding=ROUND_CEILING)
 
     return summaries, stats
 
@@ -421,19 +441,23 @@ def write_csv(path, summaries):
         writer.writerow([
             "apiukey",
             "总量",
+            "打折总量",
             "原始总量",
             "非高峰总量",
             "高峰总量",
             "高峰3倍总量",
+            "5.3-flash总量",
         ])
         for summary in summaries.values():
             writer.writerow([
                 summary.api_key,
                 decimal_to_text(summary.billable_usage),
+                decimal_to_text(summary.discounted_usage),
                 decimal_to_text(summary.total_raw_usage),
                 decimal_to_text(summary.off_peak_usage),
                 decimal_to_text(summary.peak_raw_usage),
                 decimal_to_text(summary.peak_weighted_usage),
+                decimal_to_text(summary.flash_billable_usage),
             ])
 
 
@@ -441,20 +465,24 @@ def print_table(summaries):
     headers = [
         "apiukey",
         "总量",
+        "打折总量",
         "原始总量",
         "非高峰总量",
         "高峰总量",
         "高峰3倍总量",
+        "5.3-flash总量",
     ]
     rows = []
     for summary in summaries.values():
         rows.append([
             summary.api_key,
             decimal_to_text(summary.billable_usage),
+            decimal_to_text(summary.discounted_usage),
             decimal_to_text(summary.total_raw_usage),
             decimal_to_text(summary.off_peak_usage),
             decimal_to_text(summary.peak_raw_usage),
             decimal_to_text(summary.peak_weighted_usage),
+            decimal_to_text(summary.flash_billable_usage),
         ])
 
     if not rows:
@@ -594,14 +622,18 @@ def main(argv):
     total_peak_raw_usage = sum((summary.peak_raw_usage for summary in summaries.values()), Decimal("0"))
     total_peak_weighted_usage = sum((summary.peak_weighted_usage for summary in summaries.values()), Decimal("0"))
     total_billable_usage = sum((summary.billable_usage for summary in summaries.values()), Decimal("0"))
+    total_discounted_usage = sum((summary.discounted_usage for summary in summaries.values()), Decimal("0"))
+    total_flash_billable_usage = sum((summary.flash_billable_usage for summary in summaries.values()), Decimal("0"))
 
     print("")
     print("总量汇总：")
-    print("  总量(最终计费用量)：{0}".format(decimal_to_text(total_billable_usage)))
+    print("  总量(非高峰+高峰3倍，未打折)：{0}".format(decimal_to_text(total_billable_usage)))
+    print("  打折总量(总量-5.3-flash总量×0.5)：{0}".format(decimal_to_text(total_discounted_usage)))
     print("  原始总量：{0}".format(decimal_to_text(total_raw_usage)))
     print("  非高峰总量：{0}".format(decimal_to_text(total_off_peak_usage)))
     print("  高峰总量(未加倍)：{0}".format(decimal_to_text(total_peak_raw_usage)))
     print("  高峰3倍总量：{0}".format(decimal_to_text(total_peak_weighted_usage)))
+    print("  5.3-flash总量(非高峰+高峰3倍)：{0}".format(decimal_to_text(total_flash_billable_usage)))
     print("")
     print("处理统计：")
     print("  输入文件数：{0}".format(len(files)))
@@ -621,6 +653,7 @@ def main(argv):
     print("  高峰期规则：{0:02d}:00 <= 入账时间 < {1:02d}:00（仅周一至周五，周六周日不算高峰），高峰期用量按 3 倍计入最终计费用量".format(
         args.peak_start, args.peak_end
     ))
+    print("  5.3-flash规则：总量=非高峰+高峰3倍(全模型，未打折)；打折总量=总量-5.3-flash总量×0.5（向上取整，仅flash部分打5折）")
 
     if args.output:
         write_csv(args.output, summaries)
