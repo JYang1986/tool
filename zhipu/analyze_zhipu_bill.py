@@ -14,6 +14,10 @@ unmultiplied usage is also reported. Weekends (Saturday/Sunday) are never
 treated as peak. glm-5.3-flash usage is billed at 0.5x of glm-5.3 at all
 times: the discounted usage per key equals the peak-weighted total minus
 half of the 5.3-flash peak-weighted usage, ceiled to an integer.
+
+Per-call tool rows (产品名称 K 列为【web-reader】/【search-prime】应用组件,
+单价单位=次, 用量=调用次数) are counted at a fixed 2,000,000 tokens per
+call and added flat into billed usage (no peak multiplier, no discount).
 """
 
 import argparse
@@ -36,12 +40,15 @@ NS_PACKAGE_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}
 COLUMN_TIME = "C"
 COLUMN_API_KEY = "F"
 COLUMN_MODEL = "G"
+COLUMN_PRODUCT = "K"
 COLUMN_UNIT = "P"
 COLUMN_USAGE = "S"
 TARGET_UNIT = "千token"
 FLASH_MODEL = "glm-5.3-flash"
 FLASH_BILL_RATE = Decimal("0.5")
 PEAK_MULTIPLIER = Decimal("3")
+TOOL_PRODUCTS = ("【search-prime】", "【web-reader】")
+TOOL_CALL_TOKENS = Decimal("2000000")
 EXCEL_EPOCH = _datetime.datetime(1899, 12, 30)
 
 
@@ -56,6 +63,8 @@ class BillSummary(object):
         self.billable_usage = Decimal("0")
         self.discounted_usage = Decimal("0")
         self.flash_billable_usage = Decimal("0")
+        self.tool_calls = Decimal("0")
+        self.tool_usage = Decimal("0")
 
     def add(self, usage, is_peak, is_flash):
         self.rows += 1
@@ -70,6 +79,13 @@ class BillSummary(object):
         self.billable_usage += weighted
         if is_flash:
             self.flash_billable_usage += weighted
+
+    def add_tool(self, calls):
+        """【web-reader】/【search-prime】应用组件：每次调用按固定 200万 token 计入总量。"""
+        self.rows += 1
+        self.tool_calls += calls
+        self.tool_usage += calls * TOOL_CALL_TOKENS
+        self.billable_usage += calls * TOOL_CALL_TOKENS
 
 
 def fail(message):
@@ -294,7 +310,7 @@ def iter_rows(xlsx_path, sheet_name):
             row_values = {}
             for cell in row.findall(NS_MAIN + "c"):
                 col = column_name(cell.attrib.get("r", ""))
-                if col in (COLUMN_TIME, COLUMN_API_KEY, COLUMN_MODEL, COLUMN_UNIT, COLUMN_USAGE):
+                if col in (COLUMN_TIME, COLUMN_API_KEY, COLUMN_MODEL, COLUMN_PRODUCT, COLUMN_UNIT, COLUMN_USAGE):
                     row_values[col] = cell_text(cell, shared_strings)
             yield row_values
 
@@ -382,6 +398,8 @@ def merge_summary(target, source):
     target.billable_usage += source.billable_usage
     target.discounted_usage += source.discounted_usage
     target.flash_billable_usage += source.flash_billable_usage
+    target.tool_calls += source.tool_calls
+    target.tool_usage += source.tool_usage
 
 
 def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filter=None, exclude_filter=None):
@@ -398,7 +416,9 @@ def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filt
         if unit == "单价单位" or api_key.lower() == "apikey" or normalize_text(time_value) == "入账时间":
             stats["skipped_header_rows"] += 1
             continue
-        if unit != TARGET_UNIT:
+        product = normalize_text(row.get(COLUMN_PRODUCT))
+        is_tool = any(name in product for name in TOOL_PRODUCTS)
+        if unit != TARGET_UNIT and not is_tool:
             stats["skipped_unit_rows"] += 1
             continue
         if not api_key:
@@ -413,6 +433,12 @@ def analyze_file(xlsx_path, sheet_name, peak_start_hour, peak_end_hour, key_filt
             continue
         if usage is None:
             stats["skipped_bad_usage_rows"] += 1
+            continue
+
+        if is_tool:
+            # 用量列(S)为调用次数，每次调用固定按 200万 token 计入总量
+            summaries.setdefault(api_key, BillSummary(api_key)).add_tool(usage)
+            stats["matched_rows"] += 1
             continue
 
         parsed_dt = parse_datetime_value(time_value)
@@ -447,6 +473,8 @@ def write_csv(path, summaries):
             "高峰总量",
             "高峰3倍总量",
             "5.3-flash总量",
+            "工具调用次数",
+            "工具总量",
         ])
         for summary in summaries.values():
             writer.writerow([
@@ -458,6 +486,8 @@ def write_csv(path, summaries):
                 decimal_to_text(summary.peak_raw_usage),
                 decimal_to_text(summary.peak_weighted_usage),
                 decimal_to_text(summary.flash_billable_usage),
+                decimal_to_text(summary.tool_calls),
+                decimal_to_text(summary.tool_usage),
             ])
 
 
@@ -471,6 +501,8 @@ def print_table(summaries):
         "高峰总量",
         "高峰3倍总量",
         "5.3-flash总量",
+        "工具调用次数",
+        "工具总量",
     ]
     rows = []
     for summary in summaries.values():
@@ -483,6 +515,8 @@ def print_table(summaries):
             decimal_to_text(summary.peak_raw_usage),
             decimal_to_text(summary.peak_weighted_usage),
             decimal_to_text(summary.flash_billable_usage),
+            decimal_to_text(summary.tool_calls),
+            decimal_to_text(summary.tool_usage),
         ])
 
     if not rows:
@@ -594,6 +628,12 @@ def main(argv):
     summaries = merged
     stats = merged_stats
 
+    # 打折总量 = 总量 - 5.3-flash总量 × 0.5（向上取整）；在多文件汇总后按 key 统一取整，避免分文件取整累积偏差
+    for summary in summaries.values():
+        summary.discounted_usage = (
+            summary.billable_usage - summary.flash_billable_usage * FLASH_BILL_RATE
+        ).to_integral_value(rounding=ROUND_CEILING)
+
     if key_filter:
         missing = [wanted for wanted in key_filter if not any(key_matches(k, [wanted]) for k in stats["keys_seen"])]
         if missing:
@@ -624,23 +664,27 @@ def main(argv):
     total_billable_usage = sum((summary.billable_usage for summary in summaries.values()), Decimal("0"))
     total_discounted_usage = sum((summary.discounted_usage for summary in summaries.values()), Decimal("0"))
     total_flash_billable_usage = sum((summary.flash_billable_usage for summary in summaries.values()), Decimal("0"))
+    total_tool_calls = sum((summary.tool_calls for summary in summaries.values()), Decimal("0"))
+    total_tool_usage = sum((summary.tool_usage for summary in summaries.values()), Decimal("0"))
 
     print("")
     print("总量汇总：")
-    print("  总量(非高峰+高峰3倍，未打折)：{0}".format(decimal_to_text(total_billable_usage)))
+    print("  总量(非高峰+高峰3倍+工具200万/次，未打折)：{0}".format(decimal_to_text(total_billable_usage)))
     print("  打折总量(总量-5.3-flash总量×0.5)：{0}".format(decimal_to_text(total_discounted_usage)))
     print("  原始总量：{0}".format(decimal_to_text(total_raw_usage)))
     print("  非高峰总量：{0}".format(decimal_to_text(total_off_peak_usage)))
     print("  高峰总量(未加倍)：{0}".format(decimal_to_text(total_peak_raw_usage)))
     print("  高峰3倍总量：{0}".format(decimal_to_text(total_peak_weighted_usage)))
     print("  5.3-flash总量(非高峰+高峰3倍)：{0}".format(decimal_to_text(total_flash_billable_usage)))
+    print("  工具调用次数(【web-reader】/【search-prime】)：{0}".format(decimal_to_text(total_tool_calls)))
+    print("  工具总量(200万token/次)：{0}".format(decimal_to_text(total_tool_usage)))
     print("")
     print("处理统计：")
     print("  输入文件数：{0}".format(len(files)))
     print("  总行数：{0}".format(stats["total_rows"]))
     print("  有效千token记录：{0}".format(stats["matched_rows"]))
     print("  跳过表头行：{0}".format(stats["skipped_header_rows"]))
-    print("  跳过非千token行：{0}".format(stats["skipped_unit_rows"]))
+    print("  跳过非千token行(工具按次行除外)：{0}".format(stats["skipped_unit_rows"]))
     print("  跳过空 apiKey 行：{0}".format(stats["skipped_empty_key_rows"]))
     print("  跳过无效用量行：{0}".format(stats["skipped_bad_usage_rows"]))
     if key_filter:
@@ -654,6 +698,7 @@ def main(argv):
         args.peak_start, args.peak_end
     ))
     print("  5.3-flash规则：总量=非高峰+高峰3倍(全模型，未打折)；打折总量=总量-5.3-flash总量×0.5（向上取整，仅flash部分打5折）")
+    print("  工具规则：【web-reader】/【search-prime】应用组件(单价单位=次，S列=调用次数)每次按200万token固定计入总量，不参与高峰3倍与打折")
 
     if args.output:
         write_csv(args.output, summaries)
